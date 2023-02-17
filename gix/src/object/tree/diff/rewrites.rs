@@ -1,16 +1,28 @@
 use crate::config::cache::util::ApplyLeniency;
 use crate::config::tree::Diff;
 use crate::diff::rename::Tracking;
-use crate::object::tree::diff::Renames;
+use crate::object::tree::diff::Rewrites;
 
-/// The way copies are located.
+/// From where to source copies
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum Copies {
+pub enum CopySource {
     /// Find copies from the set of changed files only.
     FromSetOfChangedFiles,
 }
 
-/// The error returned by [`Renames::try_from_config()].
+/// How to determine copied files.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct Copies {
+    /// The set of files to search when finding the source of copies.
+    pub source: CopySource,
+    /// Equivalent to [`Rewrites::percentage`], but used for copy tracking.
+    ///
+    /// Useful to have similarity-based rename tracking and cheaper copy tracking, which also is the default
+    /// as only identity plays a role.
+    pub percentage: Option<f32>,
+}
+
+/// The error returned by [`Rewrites::try_from_config()].
 #[derive(Debug, thiserror::Error)]
 #[allow(missing_docs)]
 pub enum Error {
@@ -20,9 +32,10 @@ pub enum Error {
     DiffRenameLimit(#[from] crate::config::unsigned_integer::Error),
 }
 
-impl Default for Renames {
+/// The default settings for rewrites according to the git configuration defaults.
+impl Default for Rewrites {
     fn default() -> Self {
-        Renames {
+        Rewrites {
             copies: None,
             percentage: Some(0.5),
             limit: 1000,
@@ -30,7 +43,7 @@ impl Default for Renames {
     }
 }
 
-impl Renames {
+impl Rewrites {
     /// Create an instance by reading all relevant information from the `config`uration, while being `lenient` or not.
     /// Returns `Ok(None)` if nothing is configured.
     ///
@@ -47,13 +60,16 @@ impl Renames {
             Some(renames) => match renames {
                 Tracking::Disabled => return Ok(None),
                 Tracking::Renames => None,
-                Tracking::RenamesAndCopies => Some(Copies::FromSetOfChangedFiles),
+                Tracking::RenamesAndCopies => Some(Copies {
+                    source: CopySource::FromSetOfChangedFiles,
+                    percentage: None,
+                }),
             },
             None => return Ok(None),
         };
 
         let default = Self::default();
-        Ok(Renames {
+        Ok(Rewrites {
             copies,
             limit: config
                 .integer_by_key("diff.renameLimit")

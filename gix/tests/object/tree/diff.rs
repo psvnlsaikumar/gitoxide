@@ -26,7 +26,7 @@ fn changes_against_tree_modified() -> crate::Result {
                     assert_eq!(previous_id.object().unwrap().data.as_bstr(), "a\n");
                     assert_eq!(id.object().unwrap().data.as_bstr(), "a\na1\n");
                 }
-                Event::Copy { .. } | Event::Rename { .. } | Event::Deletion { .. } | Event::Addition { .. } => {
+                Event::Rewrite { .. } | Event::Deletion { .. } | Event::Addition { .. } => {
                     unreachable!("only modification is expected")
                 }
             };
@@ -88,8 +88,8 @@ fn changes_against_tree_with_filename_tracking() -> crate::Result {
     Ok(())
 }
 
-fn tree_named<'repo>(repo: &'repo gix::Repository, rev_spec: &str) -> gix::Tree<'repo> {
-    repo.rev_parse_single(rev_spec)
+fn tree_named(repo: &gix::Repository, rev_spec: impl AsRef<str>) -> gix::Tree {
+    repo.rev_parse_single(rev_spec.as_ref())
         .unwrap()
         .object()
         .unwrap()
@@ -98,33 +98,140 @@ fn tree_named<'repo>(repo: &'repo gix::Repository, rev_spec: &str) -> gix::Tree<
         .into_tree()
 }
 
-mod renames {
+mod rewrites {
     use crate::object::tree::diff::tree_named;
     use crate::util::named_repo;
     use gix::object::tree::diff::change::Event;
+    use gix::object::tree::diff::Rewrites;
     use gix_ref::bstr::BStr;
     use std::convert::Infallible;
 
     #[test]
-    #[ignore = "needs a second round PR to finish it"]
-    fn identity() -> crate::Result {
+    #[ignore]
+    fn identity_with_mixed_in_modifications() -> crate::Result {
+        Ok(())
+    }
+
+    #[test]
+    fn rename_identity() -> crate::Result {
         let repo = named_repo("make_diff_repo.sh")?;
-        let from = tree_named(&repo, "@^{/r1-identity}~1");
-        let to = tree_named(&repo, ":/r1-identity");
+        for (commit_msg, expected, assert_msg) in [
+            (
+                "r1-identity",
+                vec![BStr::new("a"), "dir/a-moved".into()],
+                "one rename and nothing else",
+            ),
+            (
+                "r2-ambiguous",
+                vec![
+                    "s1".into(),
+                    "b1".into(),
+                    "s2".into(),
+                    "b2".into(),
+                    "s3".into(),
+                    "z".into(),
+                ],
+                "multiple possible sources decide by ordering everything lexicographically",
+            ),
+            (
+                "c4 - add identical files",
+                vec![],
+                "not having any renames is OK as well",
+            ),
+        ] {
+            let from = tree_named(&repo, format!("@^{{/{commit_msg}}}~1"));
+            let to = tree_named(&repo, format!(":/{commit_msg}"));
+
+            for percentage in [None, Some(0.5)] {
+                let mut actual = Vec::new();
+                from.changes()?
+                    .track_path()
+                    .track_rewrites(
+                        Rewrites {
+                            percentage,
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .for_each_to_obtain_tree(&to, |change| -> Result<_, Infallible> {
+                        if !change.event.entry_mode().is_tree() {
+                            if let Event::Rewrite { source_location, .. } = change.event {
+                                actual.push(source_location.to_owned());
+                                actual.push(change.location.to_owned());
+                            }
+                        }
+                        Ok(Default::default())
+                    })?;
+                assert_eq!(actual, expected, "{assert_msg}")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "fails because our similarity computation isn't exactly as the one from git"]
+    fn rename_fuzzy() -> crate::Result {
+        let repo = named_repo("make_diff_repo.sh")?;
+        let from = tree_named(&repo, "@^{/r3}~1");
+        let to = tree_named(&repo, ":/r3");
+
+        for percentage in [
+            None,
+            Some(0.76), /*cutoff point where git stops seeing it as equal */
+        ] {
+            let mut actual = Vec::new();
+            let mut rewrite_count = 0;
+            from.changes()?
+                .track_path()
+                .track_rewrites(
+                    Rewrites {
+                        percentage,
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+                .for_each_to_obtain_tree(&to, |change| -> Result<_, Infallible> {
+                    if !change.event.entry_mode().is_tree() {
+                        if let Event::Rewrite { .. } = change.event {
+                            rewrite_count += 0;
+                        } else {
+                            actual.push(change.location.to_owned());
+                        }
+                    }
+                    Ok(Default::default())
+                })?;
+            assert_eq!(
+                actual,
+                vec![BStr::new("b"), "dir/c-moved".into(), "dir/c".into()],
+                "these items include no rewrite as the cut-off is chosen accordingly"
+            )
+        }
 
         let mut actual = Vec::new();
         from.changes()?
             .track_path()
+            .track_rewrites(
+                Rewrites {
+                    percentage: Some(0.75),
+                    ..Default::default()
+                }
+                .into(),
+            )
             .for_each_to_obtain_tree(&to, |change| -> Result<_, Infallible> {
                 if !change.event.entry_mode().is_tree() {
-                    if let Event::Rename { source_location, .. } = change.event {
+                    if let Event::Rewrite { source_location, .. } = change.event {
                         actual.push(source_location.to_owned());
                         actual.push(change.location.to_owned());
                     }
                 }
                 Ok(Default::default())
             })?;
-        assert_eq!(actual, vec![BStr::new("a"), "dir/a-moved".into()]);
+        assert_eq!(
+            actual,
+            vec![BStr::new("dir/c"), "dir/c-moved".into()],
+            "it found all items at the cut-off point, similar to git"
+        );
+
         Ok(())
     }
 }

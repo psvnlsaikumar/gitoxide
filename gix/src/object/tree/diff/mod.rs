@@ -38,12 +38,12 @@ impl<'repo> Tree<'repo> {
     /// It's highly recommended to set an object cache to avoid extracting the same object multiple times.
     /// By default, similar to `git diff`, rename tracking will be enabled if it is not configured.
     #[allow(clippy::result_large_err)]
-    pub fn changes<'a>(&'a self) -> Result<Platform<'a, 'repo>, renames::Error> {
+    pub fn changes<'a>(&'a self) -> Result<Platform<'a, 'repo>, rewrites::Error> {
         Ok(Platform {
             state: Default::default(),
             lhs: self,
             tracking: None,
-            renames: self.repo.config.diff_renames()?.unwrap_or_default().into(),
+            rewrites: self.repo.config.diff_renames()?.unwrap_or_default().into(),
         })
     }
 }
@@ -54,23 +54,26 @@ pub struct Platform<'a, 'repo> {
     state: gix_diff::tree::State,
     lhs: &'a Tree<'repo>,
     tracking: Option<Tracking>,
-    renames: Option<Renames>,
+    rewrites: Option<Rewrites>,
 }
 
+/// To what extend locations of changes should be tracked.
 #[derive(Clone, Copy)]
 enum Tracking {
+    /// Know only the filename, that is the leaf-portion of the path.
     FileName,
+    /// Know the entire repository-relative path.
     Path,
 }
 
-/// A structure to capture how to perform rename tracking
+/// A structure to capture how to perform rename and copy tracking
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub struct Renames {
+pub struct Rewrites {
     /// If `Some(…)`, do also find copies. `None` is the default which does not try to detect copies at all.
     ///
     /// Note that this is an even more expensive operation than detecting renames as files.
-    pub copies: Option<renames::Copies>,
-    /// The percentage of similarity needed for files to be considered renamed or copied, defaulting to `Some(0.5)`.
+    pub copies: Option<rewrites::Copies>,
+    /// The percentage of similarity needed for files to be considered renamed, defaulting to `Some(0.5)`.
     /// This field is similar to `git diff -M50%`.
     ///
     /// If `None`, files are only considered equal if their content matches 100%.
@@ -82,7 +85,10 @@ pub struct Renames {
 }
 
 ///
-pub mod renames;
+pub mod rewrites;
+
+/// types to actually perform rename tracking.
+pub(crate) mod tracked;
 
 /// Configuration
 impl<'a, 'repo> Platform<'a, 'repo> {
@@ -100,13 +106,13 @@ impl<'a, 'repo> Platform<'a, 'repo> {
         self
     }
 
-    /// Provide `None` to disable rename tracking entirely, or pass `Some(<configuration>)` to control to
-    /// what extend rename tracking is performed.
+    /// Provide `None` to disable rewrite tracking entirely, or pass `Some(<configuration>)` to control to
+    /// what extend rename and copy tracking is performed.
     ///
-    /// Note that by default, the configuration determines rename tracking and standard git defaults are used
-    /// if nothing is configured, which turns on rename tracking with `-M50%`.
-    pub fn track_renames(&mut self, renames: Option<Renames>) -> &mut Self {
-        self.renames = renames;
+    /// Note that by default, the git configuration determines rewrite tracking and git defaults are used
+    /// if nothing is configured, which turns rename tracking with 50% similarity on, while not tracking copies at all.
+    pub fn track_rewrites(&mut self, renames: Option<Rewrites>) -> &mut Self {
+        self.rewrites = renames;
         self
     }
 }

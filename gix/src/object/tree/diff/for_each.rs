@@ -4,7 +4,8 @@ use gix_object::TreeRefIter;
 use gix_odb::FindExt;
 
 use super::{change, Action, Change, Platform, Tracking};
-use crate::object::tree::diff::Renames;
+use crate::object::tree::diff;
+use crate::object::tree::diff::tracked;
 use crate::{
     bstr::{BStr, BString, ByteSlice, ByteVec},
     ext::ObjectIdExt,
@@ -19,6 +20,10 @@ pub enum Error {
     Diff(#[from] gix_diff::tree::changes::Error),
     #[error("The user-provided callback failed")]
     ForEach(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("Could not find blob for similarity checking")]
+    FindExistingBlob(#[from] crate::object::find::existing::Error),
+    #[error("Could not configure diff algorithm prior to checking similarity")]
+    ConfigureDiffAlgorithm(#[from] crate::config::diff::algorithm::Error),
 }
 
 /// Add the item to compare to.
@@ -40,10 +45,10 @@ impl<'a, 'old> Platform<'a, 'old> {
             repo: self.lhs.repo,
             other_repo: other.repo,
             tracking: self.tracking,
-            _renames: self.renames,
             location: BString::default(),
             path_deque: Default::default(),
             visit: for_each,
+            tracked: self.rewrites.map(tracked::State::new),
             err: None,
         };
         match gix_diff::tree::Changes::from(TreeRefIter::from_bytes(&self.lhs.data)).needed_to_obtain(
@@ -52,10 +57,13 @@ impl<'a, 'old> Platform<'a, 'old> {
             |oid, buf| repo.objects.find_tree_iter(oid, buf),
             &mut delegate,
         ) {
-            Ok(()) => match delegate.err {
-                Some(err) => Err(Error::ForEach(Box::new(err))),
-                None => Ok(()),
-            },
+            Ok(()) => {
+                delegate.process_tracked_changes()?;
+                match delegate.err {
+                    Some(err) => Err(Error::ForEach(Box::new(err))),
+                    None => Ok(()),
+                }
+            }
             Err(gix_diff::tree::changes::Error::Cancelled) => delegate
                 .err
                 .map(|err| Err(Error::ForEach(Box::new(err))))
@@ -69,10 +77,10 @@ struct Delegate<'old, 'new, VisitFn, E> {
     repo: &'old Repository,
     other_repo: &'new Repository,
     tracking: Option<Tracking>,
-    _renames: Option<Renames>,
     location: BString,
     path_deque: VecDeque<BString>,
     visit: VisitFn,
+    tracked: Option<tracked::State>,
     err: Option<E>,
 }
 
@@ -90,6 +98,98 @@ impl<A, B> Delegate<'_, '_, A, B> {
             self.location.push(b'/');
         }
         self.location.push_str(name);
+    }
+}
+
+impl<'old, 'new, VisitFn, E> Delegate<'old, 'new, VisitFn, E>
+where
+    VisitFn: for<'delegate> FnMut(Change<'delegate, 'old, 'new>) -> Result<Action, E>,
+    E: std::error::Error + Sync + Send + 'static,
+{
+    /// Call `visit` on an attached version of `change`.
+    fn emit_change(
+        change: gix_diff::tree::visit::Change,
+        location: &BStr,
+        visit: &mut VisitFn,
+        repo: &'old Repository,
+        other_repo: &'new Repository,
+        stored_err: &mut Option<E>,
+    ) -> gix_diff::tree::visit::Action {
+        use gix_diff::tree::visit::Change::*;
+        let event = match change {
+            Addition { entry_mode, oid } => change::Event::Addition {
+                entry_mode,
+                id: oid.attach(other_repo),
+            },
+            Deletion { entry_mode, oid } => change::Event::Deletion {
+                entry_mode,
+                id: oid.attach(repo),
+            },
+            Modification {
+                previous_entry_mode,
+                previous_oid,
+                entry_mode,
+                oid,
+            } => change::Event::Modification {
+                previous_entry_mode,
+                entry_mode,
+                previous_id: previous_oid.attach(repo),
+                id: oid.attach(other_repo),
+            },
+        };
+        match visit(Change { event, location }) {
+            Ok(Action::Cancel) => gix_diff::tree::visit::Action::Cancel,
+            Ok(Action::Continue) => gix_diff::tree::visit::Action::Continue,
+            Err(err) => {
+                *stored_err = Some(err);
+                gix_diff::tree::visit::Action::Cancel
+            }
+        }
+    }
+
+    fn process_tracked_changes(&mut self) -> Result<(), Error> {
+        let Some(tracked) = self.tracked.as_mut() else {
+            return Ok(())
+        };
+
+        tracked.emit(
+            |dest, source| match source {
+                Some(source) => {
+                    let (oid, mode) = dest.change.oid_and_mode();
+                    let change = diff::Change {
+                        location: dest.location,
+                        event: diff::change::Event::Rewrite {
+                            source_location: source.location,
+                            source_entry_mode: source.mode,
+                            source_id: source.id.attach(self.repo),
+                            entry_mode: mode,
+                            id: oid.to_owned().attach(self.other_repo),
+                            copy: match source.kind {
+                                tracked::visit::Kind::RenameTarget => false,
+                            },
+                        },
+                    };
+                    match (self.visit)(change) {
+                        Ok(Action::Cancel) => gix_diff::tree::visit::Action::Cancel,
+                        Ok(Action::Continue) => gix_diff::tree::visit::Action::Continue,
+                        Err(err) => {
+                            self.err = Some(err);
+                            gix_diff::tree::visit::Action::Cancel
+                        }
+                    }
+                }
+                None => Self::emit_change(
+                    dest.change,
+                    dest.location,
+                    &mut self.visit,
+                    self.repo,
+                    self.other_repo,
+                    &mut self.err,
+                ),
+            },
+            self.repo,
+        )?;
+        Ok(())
     }
 }
 
@@ -134,38 +234,29 @@ where
     }
 
     fn visit(&mut self, change: gix_diff::tree::visit::Change) -> gix_diff::tree::visit::Action {
-        use gix_diff::tree::visit::Change::*;
-        let event = match change {
-            Addition { entry_mode, oid } => change::Event::Addition {
-                entry_mode,
-                id: oid.attach(self.other_repo),
-            },
-            Deletion { entry_mode, oid } => change::Event::Deletion {
-                entry_mode,
-                id: oid.attach(self.repo),
-            },
-            Modification {
-                previous_entry_mode,
-                previous_oid,
-                entry_mode,
-                oid,
-            } => change::Event::Modification {
-                previous_entry_mode,
-                entry_mode,
-                previous_id: previous_oid.attach(self.repo),
-                id: oid.attach(self.other_repo),
-            },
-        };
-        match (self.visit)(Change {
-            event,
-            location: self.location.as_ref(),
-        }) {
-            Ok(Action::Cancel) => gix_diff::tree::visit::Action::Cancel,
-            Ok(Action::Continue) => gix_diff::tree::visit::Action::Continue,
-            Err(err) => {
-                self.err = Some(err);
-                gix_diff::tree::visit::Action::Cancel
-            }
+        if let Some(tracked) = self.tracked.as_mut() {
+            tracked
+                .try_push_change(change, self.location.as_ref())
+                .map(|change| {
+                    Self::emit_change(
+                        change,
+                        self.location.as_ref(),
+                        &mut self.visit,
+                        self.repo,
+                        self.other_repo,
+                        &mut self.err,
+                    )
+                })
+                .unwrap_or(gix_diff::tree::visit::Action::Continue)
+        } else {
+            Self::emit_change(
+                change,
+                self.location.as_ref(),
+                &mut self.visit,
+                self.repo,
+                self.other_repo,
+                &mut self.err,
+            )
         }
     }
 }
