@@ -443,7 +443,7 @@ Make it the best-performing implementation and the most convenient one.
      - [ ] handle submodules
      - [ ] handle sparse directories
      - [ ] handle sparse index
-     - [ ] linear scaling with multi-threading up to IO saturation
+     - [x] linear scaling with multi-threading up to IO saturation
   - supported attributes to affect working tree and index contents
      - [ ] eol
      - [ ] working-tree-encoding
@@ -453,8 +453,10 @@ Make it the best-performing implementation and the most convenient one.
      - [ ] `ident`
      - [ ] filter processes
      - [ ] single-invocation clean/smudge filters
-* [x] access to all .gitignore/exclude information 
-* [ ] access to all attributes information
+* manage multiple worktrees
+* access to per-path information, like `.gitignore` and `.gitattributes` in a manner well suited for efficient lookups
+  * [x] _exclude_ information
+  * [ ] attributes
  
 ### gix-revision
 * [x] `describe()` (similar to `git name-rev`)
@@ -658,6 +660,8 @@ See its [README.md](https://github.com/Byron/gitoxide/blob/main/gix-lock/README.
           * [ ] obtain 'prunable' information
        * [x] proper handling of worktree related refs
        * [ ] create, move, remove, and repair
+       * [x] access exclude information
+       * [ ]  access attribute information
        * [x] respect `core.worktree` configuration
           - **deviation**
              * The delicate interplay between `GIT_COMMON_DIR` and `GIT_WORK_TREE` isn't implemented.
